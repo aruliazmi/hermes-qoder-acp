@@ -15,6 +15,9 @@ optional_env:
   - HERMES_QODER_ACP_ARGS
   - HERMES_QODER_ACP_EXTRA_ARGS
   - HERMES_QODER_ACP_TIMEOUT
+  - HERMES_QODER_ACP_TOOL_RETRIES
+  - HERMES_QODER_ACP_DEBUG_DIR
+  - HERMES_QODER_CONTEXT_WINDOW
 external_dependencies:
   - name: qodercli
     check: "qodercli --version"

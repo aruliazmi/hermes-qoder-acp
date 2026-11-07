@@ -40,11 +40,9 @@ from agent.acp_openai_bridge import (
 )
 from agent.copilot_acp_client import (
     _FS_HANDLERS,
-    _PROMPT_PREAMBLE,
     _ROLE_LABELS,
     _build_subprocess_env,
     _effective_timeout,
-    _format_messages_as_prompt,
     _model_selection_request,
     _render_message_content,
     _session_model_ids,
@@ -56,6 +54,7 @@ logger = logging.getLogger(__name__)
 PROVIDER = "qoder-acp"
 ACP_MARKER_BASE_URL = "acp://qoder"
 DEFAULT_TIMEOUT_SECONDS = 900.0
+DEFAULT_TOOL_RETRIES = 2
 AUTH_REQUIRED_CODE = -32000
 
 # Where the qoder installer drops the real binary, in priority order.
@@ -123,6 +122,37 @@ def _resolve_timeout(timeout: Any) -> float:
     return _effective_timeout(timeout)
 
 
+def _has_tool_call(text: str) -> bool:
+    """True when the reply carries a parseable <tool_call> block.
+
+    Uses the same extractor Hermes uses, so the retry condition matches what the
+    OpenAI surface will actually hand back.
+    """
+    if not text or "<tool_call" not in text:
+        return False
+    calls, _cleaned = _extract_tool_calls_from_text(text)
+    return bool(calls)
+
+
+def _resolve_tool_retries() -> int:
+    """How many extra in-session nudge prompts to spend recovering a lost call."""
+    env = os.environ.get("HERMES_QODER_ACP_TOOL_RETRIES", "").strip()
+    if env:
+        with contextlib.suppress(ValueError):
+            return max(0, int(env))
+    return DEFAULT_TOOL_RETRIES
+
+
+# Sent as the next turn in the SAME session when a tool was offered, no call came
+# back, and the model answered with prose instead. Kept terse on purpose: the
+# session already holds the full contract, so this only names the miss.
+_TOOL_RETRY_NUDGE = (
+    "You answered in prose. The tool you need IS available — your own tool "
+    "inventory is unrelated to it and is not the one that runs. Reply now with "
+    "ONLY the <tool_call>{...}</tool_call> block, nothing else."
+)
+
+
 def _jsonrpc_result(message_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": message_id, "result": result}
 
@@ -131,30 +161,35 @@ def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": message_id, "error": {"code": code, "message": message}}
 
 
-# Hermes' bundled ACP preamble assumes the CLI has tools of its own. Qoder runs
-# with `--tools ""`, so the model sees an EMPTY tool inventory and concludes it
-# "cannot" act — it then refuses instead of emitting the tool call. The preamble
-# is therefore built per-request: the tool-call contract is stated ONLY when the
-# request actually carries tools, or the model invents calls (e.g. `clarify`) for
-# plain chat turns.
+# Hermes' bundled ACP preamble tells the CLI it has its own tools. Qoder runs
+# with `--tools ""`, so its REAL tool inventory is empty — and the model, told
+# about a tool channel that "does not exist", tends to conclude it cannot act and
+# answers with prose ("I tried but the backend returned Tool not found") instead
+# of emitting the call. Two hard rules for this preamble:
+#
+#   1. Never mention MCP, tool registries, or "no tools available". Naming the
+#      empty inventory in the prompt is what makes the model narrate it. The
+#      prompt must simply DECLARE the contract and move on.
+#   2. State the contract only when the request actually carries tools, or the
+#      model invents calls (e.g. `clarify`) for plain chat turns.
+#
+# Empirically: an earlier verbose preamble (which explicitly argued "MCP is empty
+# ON PURPOSE... 'No tools available' is false") made the model hallucinate
+# "Tool \"terminal\" not found" on ~1/3 of runs; the plain contract below runs
+# consistently. Keep it short and factual.
 _PLAIN_PREAMBLE = (
-    "You are the active ACP agent backend for Hermes Agent. Hermes owns all tools; you never "
-    "execute anything yourself. This turn carries NO tools — just answer in plain text.",
+    "You are the model backend for Hermes Agent. Hermes executes every tool; you never run "
+    "anything yourself. This turn carries no tools — answer in plain text.",
 )
 
 _TOOL_PREAMBLE = (
-    "You are the active ACP agent backend for Hermes Agent. Hermes owns all tools; you never "
-    "execute anything yourself.",
-    'Your session\'s own built-in tools are disabled ON PURPOSE and MCP is empty ON PURPOSE. That '
-    'is expected — it is NOT a reason you cannot act. "No tools available" is false: the "Available '
-    'tools" section below IS your toolset.',
-    "To use a tool you MUST answer with ONLY a <tool_call>{...}</tool_call> block containing one JSON "
+    "You are the model backend for Hermes Agent. Hermes executes every tool; you never run "
+    "anything yourself. Selecting a tool below and emitting the call IS you acting — Hermes "
+    "runs it and returns the result on the next turn.",
+    'To use a tool, answer with ONLY a <tool_call>{...}</tool_call> block holding one JSON '
     'object: {"id": "<unique>", "type": "function", "function": {"name": "<tool name>", '
     '"arguments": "<JSON-encoded arguments as a string>"}}.',
-    "Only call a tool that appears in the list below, and only when the task needs it. Never invent "
-    "a tool name. Emit the <tool_call> block and Hermes runs it, returning the result as a Tool: line "
-    "on the next turn.",
-    "When no tool is needed, answer normally in plain text.",
+    "Use only a tool from the list below. When no tool is needed, answer normally in plain text.",
 )
 
 
@@ -461,7 +496,14 @@ class QoderACPClient:
         with self._session(timeout_seconds, allow_file_requests=False) as (session, _request):
             return _session_model_ids(session)
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        model: str | None = None,
+        expect_tool_call: bool = False,
+    ) -> tuple[str, str]:
         requested_model = str(model or "").strip()
         with self._session(timeout_seconds) as (session, _request):
             session_id = str(session.get("sessionId") or "").strip()
@@ -476,15 +518,35 @@ class QoderACPClient:
                             "Qoder ACP does not offer model %r (advertised: %s); using the session default.",
                             requested_model, ", ".join(advertised) or "none",
                         )
-            text_parts: list[str] = []
-            reasoning_parts: list[str] = []
-            _request(
-                "session/prompt",
-                {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]},
-                text_parts=text_parts,
-                reasoning_parts=reasoning_parts,
-            )
-            return "".join(text_parts), "".join(reasoning_parts)
+
+            def _one_prompt(text: str) -> tuple[str, str]:
+                text_parts: list[str] = []
+                reasoning_parts: list[str] = []
+                _request(
+                    "session/prompt",
+                    {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]},
+                    text_parts=text_parts,
+                    reasoning_parts=reasoning_parts,
+                )
+                return "".join(text_parts), "".join(reasoning_parts)
+
+            response_text, reasoning = _one_prompt(prompt_text)
+
+            # The model is nondeterministic about the tool-call contract: told a
+            # tool exists, it still sometimes answers with prose — often inventing
+            # "Tool <name> not found" / "no tools available". Re-prompting in the
+            # SAME session (so it sees its own refusal) with a one-line nudge
+            # recovers the call cheaply. Never retry when no tools were offered,
+            # and never more than HERMES_QODER_ACP_TOOL_RETRIES times.
+            if expect_tool_call and not _has_tool_call(response_text):
+                retries = _resolve_tool_retries()
+                for attempt in range(retries):
+                    logger.debug("qoder-acp: no tool call in reply, retry %d/%d", attempt + 1, retries)
+                    retry_text, retry_reasoning = _one_prompt(_TOOL_RETRY_NUDGE)
+                    if _has_tool_call(retry_text):
+                        response_text, reasoning = retry_text, retry_reasoning
+                        break
+            return response_text, reasoning
 
     def _create_chat_completion(
         self,
@@ -499,7 +561,10 @@ class QoderACPClient:
     ) -> Any:
         prompt_text = format_messages_as_prompt(messages or [], model=model, tools=tools, tool_choice=tool_choice)
         response_text, reasoning = self._run_prompt(
-            prompt_text, timeout_seconds=_resolve_timeout(timeout), model=model
+            prompt_text,
+            timeout_seconds=_resolve_timeout(timeout),
+            model=model,
+            expect_tool_call=bool(tools),
         )
         if debug_dir := os.environ.get("HERMES_QODER_ACP_DEBUG_DIR", "").strip():
             try:
