@@ -97,6 +97,19 @@ def _resolve_args() -> list[str]:
     else:
         # --tools "" disables every built-in tool; Qoder must not act on the host.
         args = ["--acp", "--tools", ""]
+    # Qoder's ACP session/new advertises no context window (mode + model only), so
+    # the CLI flag is the only knob that actually raises it. Without this the
+    # session runs at Qoder's default even though Hermes believes 1M.
+    if "--context-window" not in args:
+        ctx = (os.environ.get("HERMES_QODER_CONTEXT_WINDOW") or "").strip()
+        if not ctx:
+            try:
+                from .qoder_catalog import _DEFAULT_CONTEXT_WINDOW as _dcw
+            except ImportError:
+                from qoder_catalog import _DEFAULT_CONTEXT_WINDOW as _dcw
+            ctx = str(_dcw)
+        if ctx and ctx != "0":
+            args += ["--context-window", ctx]
     if extra := os.environ.get("HERMES_QODER_ACP_EXTRA_ARGS", "").strip():
         args.extend(shlex.split(extra))
     return args

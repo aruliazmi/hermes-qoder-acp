@@ -81,8 +81,27 @@ _REASONING_SLUGS = {
     "kmodel_latest", "kmodel", "gmodel", "gfmodel", "dmodel", "dfmodel", "mmodel",
 }
 
-# Qoder exposes 200K / 400K / 1M context options; declare the safe floor.
-_DEFAULT_CONTEXT_WINDOW = 200_000
+# Qoder's ACP session/new advertises NO window (only mode + model), so the
+# number has to come from the CLI flag `--context-window`. We pass 1M and declare
+# the same value here, or Hermes compacts at 200K while the model can hold 1M.
+# Override with HERMES_QODER_CONTEXT_WINDOW (set 0 to fall back to 200K).
+def _env_context_window() -> int:
+    import os
+
+    raw = (os.environ.get("HERMES_QODER_CONTEXT_WINDOW") or "").strip()
+    if raw:
+        try:
+            val = int(raw)
+        except ValueError:
+            val = 0
+        if val > 0:
+            return val
+        if raw == "0":
+            return 200_000
+    return 1_000_000
+
+
+_DEFAULT_CONTEXT_WINDOW = _env_context_window()
 
 
 def resolve_model(name: str) -> str:
