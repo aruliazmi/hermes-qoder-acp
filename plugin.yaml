@@ -1,0 +1,21 @@
+name: qoder-acp
+kind: model-provider
+manifest_version: 2
+version: 0.1.0
+description: "Qoder CLI (ACP) — run Hermes on a Qoder subscription through the official qodercli in ACP mode; Qoder is only the model, Hermes executes every tool"
+author: Miles
+license: MIT
+homepage: https://docs.qoder.com/cli/acp
+platforms: [linux, macos, windows]
+requires_hermes: ">=0.22.0"
+tags: [model-provider, qoder, acp, external-process, subscription]
+optional_env:
+  - HERMES_QODER_ACP_COMMAND
+  - QODER_CLI_PATH
+  - HERMES_QODER_ACP_ARGS
+  - HERMES_QODER_ACP_EXTRA_ARGS
+  - HERMES_QODER_ACP_TIMEOUT
+external_dependencies:
+  - name: qodercli
+    check: "qodercli --version"
+    install: "curl -fsSL https://qoder.com/install | bash  # then sign in once: qodercli login"
